@@ -399,11 +399,14 @@ class Mmu:
         self.toolhead_entry_to_extruder = config.getfloat('toolhead_entry_to_extruder', 0., minval=0.) # For extruder (entry) sensor
         self.toolhead_residual_filament = config.getfloat('toolhead_residual_filament', 0., minval=0., maxval=50.) # +ve value = reduction of load length
         self.toolhead_ooze_reduction = config.getfloat('toolhead_ooze_reduction', 0., minval=-5., maxval=20.) # +ve value = reduction of load length
-        self.toolhead_unload_safety_margin = config.getfloat('toolhead_unload_safety_margin', 10., minval=0.) # Extra unload distance
         self.toolhead_move_error_tolerance = config.getfloat('toolhead_move_error_tolerance', 60, minval=0, maxval=100) # Allowable delta movement % before error
         self.toolhead_entry_tension_test = config.getint('toolhead_entry_tension_test', 1, minval=0, maxval=1) # Use filament compression to test for successful extruder entry (requires compression sensor)
         self.toolhead_post_load_tighten = config.getint('toolhead_post_load_tighten', 60, minval=0, maxval=100) # Whether to apply filament tightening move after load (if not synced)
         self.toolhead_post_load_tension_adjust = config.getint('toolhead_post_load_tension_adjust', 1, minval=0, maxval=1) # Whether to use sync-feedback sensor to adjust tension (synced)
+        self.toolhead_unload_force_homing = config.getint('toolhead_unload_force_homing', 0, minval=0, maxval=1) # Option to home to toolhead sensor during unload if available
+        self.toolhead_unload_safety_margin = config.getfloat('toolhead_unload_safety_margin', 10., minval=0.) # Extra unload distance for toolhead sensor homing
+        self.extruder_unload_force_homing = config.getint('extruder_unload_force_homing', 1, minval=0, maxval=1) # Option to home to extruder entry sensor during unload if available
+        self.extruder_unload_safety_margin = config.getfloat('extruder_unload_safety_margin', 10., minval=0.) # Extra unload distance for extruder entry sensor homing
 
         # Synchronous motor control
         self.sync_to_extruder = config.getint('sync_to_extruder', 0, minval=0, maxval=1)
@@ -5177,7 +5180,6 @@ class Mmu:
         with self.wrap_action(self.ACTION_UNLOADING_EXTRUDER):
             self.log_debug("Extracting filament from extruder")
             self._set_filament_direction(self.DIRECTION_UNLOAD)
-
             self._ensure_safe_extruder_temperature(wait=False)
 
             synced = self.selector.get_filament_grip_state() == self.FILAMENT_DRIVE_STATE and not extruder_only
@@ -5190,9 +5192,75 @@ class Mmu:
                 speed = self.extruder_unload_speed
                 motor = "extruder"
 
+            cut_tip_vars = self.printer.lookup_object("gcode_macro _MMU_CUT_TIP_VARS", None)
+            if cut_tip_vars is not None:
+                blade_pos = cut_tip_vars.variables.get('blade_pos', 0.0)
+                rip_length = cut_tip_vars.variables.get('rip_length', 0.0)
+            else:
+                blade_pos = 0.0
+                rip_length = 0.0
+
             fhomed = False
-            if self.sensor_manager.has_sensor(self.SENSOR_EXTRUDER_ENTRY) and not extruder_only:
-                # BEST Strategy: Extruder exit movement leveraging extruder entry sensor. Must be synced
+
+            if self.sensor_manager.has_sensor(self.SENSOR_TOOLHEAD) and self.toolhead_unload_force_homing:
+                if not self.sensor_manager.check_sensor(self.SENSOR_TOOLHEAD):
+                    self.log_warning("Warning: Filament was not detected in extruder by toolhead sensor at start of extruder unload\nWill attempt to continue...")
+                    fhomed = True # Assumption
+                else:
+                    hlength = self.toolhead_sensor_to_nozzle + self.toolhead_unload_safety_margin - blade_pos - rip_length
+                    self.log_debug("Reverse homing up to %.1fmm off toolhead sensor%s" % (hlength, (" (synced)" if synced else "")))
+                    _,fhomed,_,_ = self.trace_filament_move("Reverse homing off toolhead sensor", -hlength, motor=motor, homing_move=-1, endstop_name=self.SENSOR_TOOLHEAD)
+                if not fhomed:
+                    raise MmuError("Failed to reach toolhead sensor after moving %.1fmm" % hlength)
+                else:
+                    validate = False
+                    # We know exactly where end of filament is so true up
+                    self._set_filament_pos_state(self.FILAMENT_POS_HOMED_TS)
+                    self._set_filament_position(-self.toolhead_sensor_to_nozzle)
+
+                if not(self.sensor_manager.has_sensor(self.SENSOR_EXTRUDER_ENTRY) and not extruder_only and self.extruder_unload_force_homing):
+                    # Finish up with regular extruder exit movement. Optionally synced
+                    length = max(0, self.toolhead_extruder_to_nozzle + self._get_filament_position()) + self.extruder_unload_safety_margin
+                    self.log_debug("Unloading last %.1fmm to exit the extruder%s" % (length, " (synced)" if synced else ""))
+                    _,_,measured,delta = self.trace_filament_move("Unloading extruder", -length, speed=speed, motor=motor, wait=True)
+                    
+                    # Best guess of filament position is right at extruder entrance or just beyond if synced
+                    if synced:
+                        self._set_filament_position(-(self.toolhead_extruder_to_nozzle + self.extruder_unload_safety_margin))
+                    else:
+                        self._set_filament_position(-self.toolhead_extruder_to_nozzle)
+	
+                    # Encoder based validation test if it has high chance of being useful
+                    # NOTE: This check which used to raise MmuError() is triping many folks up because they have poor tip forming
+                    #       logic so just log error and continue. This disguises the root cause problem but will make folks happier
+                    #       Not performed for slicer tip forming (validate=True) because everybody is ejecting the filament!
+                    if validate and self._can_use_encoder() and length > self.encoder_move_step_size and not extruder_only and self.gate_selected != self.TOOL_GATE_BYPASS:
+                        self.log_debug("Total measured movement: %.1fmm, total delta: %.1fmm" % (measured, delta))
+                        msg = None
+                        if measured < self.encoder_min:
+                            msg = "any"
+                        elif synced and delta > length * (self.toolhead_move_error_tolerance / 100.):
+                            msg = "suffient"
+                        if msg:
+                            self.log_warning("Warning: Encoder not sensing %s movement during final extruder retraction move\nConcluding filament either stuck in the extruder, tip forming erroneously completely ejected filament or filament was not fully loaded\nWill attempt to continue..." % msg)
+                            
+                    self._set_filament_pos_state(self.FILAMENT_POS_END_BOWDEN)
+	
+                    # Proportional sensor unload validation: spin extruder forward and check sensor doesn't change.
+                    # After unload, if the extruder still grips the filament the sensor will be in tension (gear pulled
+                    # back against extruder grip). A forward extruder spin would relieve that tension causing the sensor
+                    # to shift toward compression. If the filament has cleared, the extruder spins freely and the sensor
+                    # reading is unchanged.
+                    if (
+                        validate
+                        and self.sensor_manager.has_sensor(self.SENSOR_PROPORTIONAL)
+                        and self.extruder_homing_endstop == self.SENSOR_EXTRUDER_ENTRY_PROP
+                        and not extruder_only
+                        and self.gate_selected != self.TOOL_GATE_BYPASS
+                    ):
+                        self._validate_extruder_unload_proportional()
+            
+            if self.sensor_manager.has_sensor(self.SENSOR_EXTRUDER_ENTRY) and not extruder_only and self.extruder_unload_force_homing:
                 synced = True
                 self.selector.filament_drive()
                 speed = self.extruder_sync_unload_speed
@@ -5205,7 +5273,10 @@ class Mmu:
                         self.log_warning("Warning: Filament was not detected by extruder (entry) sensor at start of extruder unload\nWill attempt to continue...")
                         fhomed = True # Assumption
                 else:
-                    hlength = self.toolhead_extruder_to_nozzle + self.toolhead_entry_to_extruder + self.toolhead_unload_safety_margin - self.toolhead_residual_filament - self.toolhead_ooze_reduction - self.toolchange_retract
+                    if self.filament_pos == self.FILAMENT_POS_HOMED_TS:
+                        hlength = self.toolhead_extruder_to_nozzle - self.toolhead_sensor_to_nozzle  + self.toolhead_entry_to_extruder + self.extruder_unload_safety_margin
+                    else:
+                        hlength = self.toolhead_extruder_to_nozzle + self.toolhead_entry_to_extruder + self.extruder_unload_safety_margin - blade_pos - rip_length
                     self.log_debug("Reverse homing up to %.1fmm off extruder sensor (synced) to exit extruder" % hlength)
                     _,fhomed,_,_ = self.trace_filament_move("Reverse homing off extruder sensor", -hlength, motor=motor, homing_move=-1, endstop_name=self.SENSOR_EXTRUDER_ENTRY)
 
@@ -5221,66 +5292,7 @@ class Mmu:
                 #      So former MmuError() has been changed to error message
                 if self.sensor_manager.check_sensor(self.SENSOR_TOOLHEAD):
                     self.log_warning("Warning: Toolhead sensor still reports filament is present in toolhead! Possible sensor malfunction\nWill attempt to continue...")
-
-            else:
-                if self.sensor_manager.has_sensor(self.SENSOR_TOOLHEAD):
-                    # NEXT BEST: With toolhead sensor we first home to toolhead sensor. Optionally synced
-                    if not self.sensor_manager.check_sensor(self.SENSOR_TOOLHEAD):
-                        self.log_warning("Warning: Filament was not detected in extruder by toolhead sensor at start of extruder unload\nWill attempt to continue...")
-                        fhomed = True # Assumption
-                    else:
-                        hlength = self.toolhead_sensor_to_nozzle + self.toolhead_unload_safety_margin - self.toolhead_residual_filament - self.toolhead_ooze_reduction - self.toolchange_retract
-                        self.log_debug("Reverse homing up to %.1fmm off toolhead sensor%s" % (hlength, (" (synced)" if synced else "")))
-                        _,fhomed,_,_ = self.trace_filament_move("Reverse homing off toolhead sensor", -hlength, motor=motor, homing_move=-1, endstop_name=self.SENSOR_TOOLHEAD)
-                    if not fhomed:
-                        raise MmuError("Failed to reach toolhead sensor after moving %.1fmm" % hlength)
-                    else:
-                        validate = False
-                        # We know exactly where end of filament is so true up
-                        self._set_filament_pos_state(self.FILAMENT_POS_HOMED_TS)
-                        self._set_filament_position(-self.toolhead_sensor_to_nozzle)
-
-                # Finish up with regular extruder exit movement. Optionally synced
-                length = max(0, self.toolhead_extruder_to_nozzle + self._get_filament_position()) + self.toolhead_unload_safety_margin
-                self.log_debug("Unloading last %.1fmm to exit the extruder%s" % (length, " (synced)" if synced else ""))
-                _,_,measured,delta = self.trace_filament_move("Unloading extruder", -length, speed=speed, motor=motor, wait=True)
-
-                # Best guess of filament position is right at extruder entrance or just beyond if synced
-                if synced:
-                    self._set_filament_position(-(self.toolhead_extruder_to_nozzle + self.toolhead_unload_safety_margin))
-                else:
-                    self._set_filament_position(-self.toolhead_extruder_to_nozzle)
-
-                # Encoder based validation test if it has high chance of being useful
-                # NOTE: This check which used to raise MmuError() is triping many folks up because they have poor tip forming
-                #       logic so just log error and continue. This disguises the root cause problem but will make folks happier
-                #       Not performed for slicer tip forming (validate=True) because everybody is ejecting the filament!
-                if validate and self._can_use_encoder() and length > self.encoder_move_step_size and not extruder_only and self.gate_selected != self.TOOL_GATE_BYPASS:
-                    self.log_debug("Total measured movement: %.1fmm, total delta: %.1fmm" % (measured, delta))
-                    msg = None
-                    if measured < self.encoder_min:
-                        msg = "any"
-                    elif synced and delta > length * (self.toolhead_move_error_tolerance / 100.):
-                        msg = "suffient"
-                    if msg:
-                        self.log_warning("Warning: Encoder not sensing %s movement during final extruder retraction move\nConcluding filament either stuck in the extruder, tip forming erroneously completely ejected filament or filament was not fully loaded\nWill attempt to continue..." % msg)
-
-                self._set_filament_pos_state(self.FILAMENT_POS_END_BOWDEN)
-
-                # Proportional sensor unload validation: spin extruder forward and check sensor doesn't change.
-                # After unload, if the extruder still grips the filament the sensor will be in tension (gear pulled
-                # back against extruder grip). A forward extruder spin would relieve that tension causing the sensor
-                # to shift toward compression. If the filament has cleared, the extruder spins freely and the sensor
-                # reading is unchanged.
-                if (
-                    validate
-                    and self.sensor_manager.has_sensor(self.SENSOR_PROPORTIONAL)
-                    and self.extruder_homing_endstop == self.SENSOR_EXTRUDER_ENTRY_PROP
-                    and not extruder_only
-                    and self.gate_selected != self.TOOL_GATE_BYPASS
-                ):
-                    self._validate_extruder_unload_proportional()
-
+                    
             self._random_failure() # Testing
             self.movequeues_wait()
             self.log_debug("Filament should be out of extruder")
@@ -7885,7 +7897,10 @@ class Mmu:
         self.toolhead_extruder_to_nozzle = gcmd.get_float('TOOLHEAD_EXTRUDER_TO_NOZZLE', self.toolhead_extruder_to_nozzle, minval=0.)
         self.toolhead_residual_filament = gcmd.get_float('TOOLHEAD_RESIDUAL_FILAMENT', self.toolhead_residual_filament, minval=0.)
         self.toolhead_ooze_reduction = gcmd.get_float('TOOLHEAD_OOZE_REDUCTION', self.toolhead_ooze_reduction, minval=-5., maxval=20.)
-        self.toolhead_unload_safety_margin = gcmd.get_float('TOOLHEAD_UNLOAD_SAFETY_MARGIN', self.toolhead_unload_safety_margin, minval=0.)
+        self.toolhead_unload_force_homing = gcmd.get_int('TOOLHEAD_UNLOAD_FORCE_HOMING', self.toolhead_unload_force_homing, minval=0, maxval=1) # Option to home to toolhead sensor during unload if available
+        self.toolhead_unload_safety_margin = gcmd.get_float('TOOLHEAD_UNLOAD_SAFETY_MARGIN', self.toolhead_unload_safety_margin, minval=0.) # Extra unload distance for toolhead sensor homing
+        self.extruder_unload_force_homing = gcmd.get_int('EXTRUDER_UNLOAD_FORCE_HOMING', self.extruder_unload_force_homing, minval=0, maxval=1) # Option to home to extruder entry sensor during unload if available
+        self.extruder_unload_safety_margin = gcmd.get_float('EXTRUDER_UNLOAD_SAFETY_MARGIN', self.extruder_unload_safety_margin, minval=0.) # Extra unload distance for extruder entry sensor homing
         self.toolhead_post_load_tighten = gcmd.get_int('TOOLHEAD_POST_LOAD_TIGHTEN', self.toolhead_post_load_tighten, minval=0, maxval=100)
         self.toolhead_post_load_tension_adjust = gcmd.get_int('TOOLHEAD_POST_LOAD_TENSION_ADJUST', self.toolhead_post_load_tension_adjust, minval=0, maxval=1)
         self.toolhead_entry_tension_test = gcmd.get_int('TOOLHEAD_ENTRY_TENSION_TEST', self.toolhead_entry_tension_test, minval=0, maxval=1)
@@ -8043,7 +8058,10 @@ class Mmu:
                 msg += "\ntoolhead_entry_to_extruder = %.1f" % self.toolhead_entry_to_extruder
             msg += "\ntoolhead_residual_filament = %.1f" % self.toolhead_residual_filament
             msg += "\ntoolhead_ooze_reduction = %.1f" % self.toolhead_ooze_reduction
-            msg += "\ntoolhead_unload_safety_margin = %d" % self.toolhead_unload_safety_margin
+            msg += "\ntoolhead_unload_force_homing = %d" % self.toolhead_unload_force_homing
+            msg += "\ntoolhead_unload_safety_margin = %.1f" % self.toolhead_unload_safety_margin
+            msg += "\nextruder_unload_force_homing = %d" % self.extruder_unload_force_homing
+            msg += "\nextruder_unload_safety_margin = %.1f" % self.extruder_unload_safety_margin
             msg += "\ntoolhead_entry_tension_test = %d" % self.toolhead_entry_tension_test
             msg += "\ntoolhead_post_load_tighten = %d" % self.toolhead_post_load_tighten
             msg += "\ntoolhead_post_load_tension_adjust = %d" % self.toolhead_post_load_tension_adjust
