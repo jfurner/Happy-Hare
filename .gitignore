@@ -1,2 +1,4 @@
 my_*.cfg
 .DS_Store
+__pycache__/
+*.py[cod]
