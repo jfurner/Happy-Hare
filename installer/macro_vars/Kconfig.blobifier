@@ -221,9 +221,13 @@ menu "Blobifier            (_BLOBIFIER)"
     float "Minimum purge length           "
     default 30
 
-  config VAR_BLOBIFIER_PURGE_LENGTH_MAXIMUM
-    float "Maximum purge length           "
+  config VAR_BLOBIFIER_MAXIMUM_BLOB_SIZE
+    float "Maximum blob size              "
     default 150
+
+  config VAR_BLOBIFIER_MINIMUM_BLOB_SIZE
+    float "Minimum blob size              "
+    default 125
 
   config VAR_BLOBIFIER_PURGE_LENGTH
     float "Default purge length           "
@@ -259,6 +263,14 @@ menu "Blobifier            (_BLOBIFIER)"
   config VAR_BLOBIFIER_SHAKE_ACCEL
     float "Shake acceleration             "
     default 10000
+
+  config VAR_BLOBIFIER_SHAKE_SPEED
+    float "Shake speed             "
+    default 200
+
+  config VAR_BLOBIFIER_SHAKE_DIST
+    float "Shake distance             "
+    default 8
 
   config VAR_BLOBIFIER_BUCKET_SHAKE_FREQUENCY
     float "Bucket shake frequency         "
